@@ -73,11 +73,91 @@ session_start();
 $db = new Database();
 $conn = $db->getConnection();
 
+function validateIncident(array $data): array {
+    $errors = [];
+
+    $incidentDate = trim($data['incident_date'] ?? '');
+    $incidentType = trim($data['incident_type'] ?? '');
+    $description = trim($data['description'] ?? '');
+    $urgency = $data['urgency_level'] ?? '';
+
+    if ($incidentDate === '') {
+        $errors[] = 'Incident date is required.';
+    } else {
+        $date = DateTime::createFromFormat('Y-m-d\TH:i', $incidentDate);
+        if (!$date || $date->format('Y-m-d\TH:i') !== $incidentDate) {
+            $errors[] = 'Incident date must be in ISO datetime format.';
+        }
+    }
+
+    if ($incidentType === '') {
+        $errors[] = 'Incident type is required.';
+    }
+
+    if ($description === '') {
+        $errors[] = 'Description is required.';
+    }
+
+    $allowedUrgency = ['low', 'medium', 'high'];
+    if (!in_array($urgency, $allowedUrgency, true)) {
+        $errors[] = 'Urgency level is invalid.';
+    }
+
+    return $errors;
+}
+
+function validateUpdate(array $data): array {
+    $errors = [];
+
+    $updateText = trim($data['update_text'] ?? '');
+    $updateType = $data['update_type'] ?? '';
+    $allowedTypes = ['general', 'escalation', 'resolution', 'legal_action', 'follow_up'];
+
+    if ($updateText === '') {
+        $errors[] = 'Update text is required.';
+    }
+
+    if (!in_array($updateType, $allowedTypes, true)) {
+        $errors[] = 'Update type is invalid.';
+    }
+
+    return $errors;
+}
+
 // Handle form submissions
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['action'])) {
         switch ($_POST['action']) {
             case 'create_incident':
+                $incidentData = [
+                    'incident_date' => $_POST['incident_date'] ?? '',
+                    'incident_type' => $_POST['incident_type'] ?? '',
+                    'location' => $_POST['location'] ?? '',
+                    'communication_method' => $_POST['communication_method'] ?? '',
+                    'witnesses' => $_POST['witnesses'] ?? '',
+                    'children_present' => $_POST['children_present'] ?? '',
+                    'description' => $_POST['description'] ?? '',
+                    'direct_quotes' => $_POST['direct_quotes'] ?? '',
+                    'child_impact' => $_POST['child_impact'] ?? '',
+                    'your_response' => $_POST['your_response'] ?? '',
+                    'evidence_list' => $_POST['evidence_list'] ?? '',
+                    'legal_violations' => $_POST['legal_violations'] ?? '',
+                    'pattern_notes' => $_POST['pattern_notes'] ?? '',
+                    'urgency_level' => $_POST['urgency_level'] ?? ''
+                ];
+
+                $incidentData = array_map(function ($value) {
+                    return is_string($value) ? trim($value) : $value;
+                }, $incidentData);
+
+                $errors = validateIncident($incidentData);
+                if (!empty($errors)) {
+                    $_SESSION['message'] = '❌ Unable to create incident: ' . implode(' ', $errors);
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php');
+                    exit;
+                }
+
                 $stmt = $conn->prepare("
                     INSERT INTO incidents (incident_date, incident_type, location, communication_method,
                                          witnesses, children_present, description, direct_quotes,
@@ -85,38 +165,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                          pattern_notes, urgency_level)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ");
-                
+
                 $stmt->execute([
-                    $_POST['incident_date'],
-                    $_POST['incident_type'],
-                    $_POST['location'],
-                    $_POST['communication_method'],
-                    $_POST['witnesses'],
-                    $_POST['children_present'],
-                    $_POST['description'],
-                    $_POST['direct_quotes'],
-                    $_POST['child_impact'],
-                    $_POST['your_response'],
-                    $_POST['evidence_list'],
-                    $_POST['legal_violations'],
-                    $_POST['pattern_notes'],
-                    $_POST['urgency_level']
+                    $incidentData['incident_date'],
+                    $incidentData['incident_type'],
+                    $incidentData['location'],
+                    $incidentData['communication_method'],
+                    $incidentData['witnesses'],
+                    $incidentData['children_present'],
+                    $incidentData['description'],
+                    $incidentData['direct_quotes'],
+                    $incidentData['child_impact'],
+                    $incidentData['your_response'],
+                    $incidentData['evidence_list'],
+                    $incidentData['legal_violations'],
+                    $incidentData['pattern_notes'],
+                    $incidentData['urgency_level']
                 ]);
-                
+
                 $_SESSION['message'] = "✅ Incident #" . $conn->lastInsertId() . " documented successfully!";
                 $_SESSION['message_type'] = "success";
                 header('Location: index.php');
                 exit;
-                
+
             case 'add_update':
+                $updateData = [
+                    'incident_id' => $_POST['incident_id'] ?? '',
+                    'update_text' => $_POST['update_text'] ?? '',
+                    'update_type' => $_POST['update_type'] ?? ''
+                ];
+
+                $updateData = array_map(function ($value) {
+                    return is_string($value) ? trim($value) : $value;
+                }, $updateData);
+
+                $errors = validateUpdate($updateData);
+                if (!empty($errors)) {
+                    $_SESSION['message'] = '❌ Unable to add update: ' . implode(' ', $errors);
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=detail&id=' . $updateData['incident_id']);
+                    exit;
+                }
+
                 $stmt = $conn->prepare("
                     INSERT INTO incident_updates (incident_id, update_text, update_type)
                     VALUES (?, ?, ?)
                 ");
                 $stmt->execute([
-                    $_POST['incident_id'], 
-                    $_POST['update_text'],
-                    $_POST['update_type']
+                    $updateData['incident_id'],
+                    $updateData['update_text'],
+                    $updateData['update_type']
                 ]);
                 
                 $stmt = $conn->prepare("UPDATE incidents SET updated_at = CURRENT_TIMESTAMP WHERE id = ?");
@@ -354,11 +452,17 @@ $view = $_GET['view'] ?? 'dashboard';
             border-left: 5px solid #28a745;
             color: #155724;
         }
-        
+
         .alert.info {
             background: linear-gradient(135deg, #d1ecf1 0%, #bee5eb 100%);
             border-left: 5px solid #17a2b8;
             color: #0c5460;
+        }
+
+        .alert.error {
+            background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
+            border-left: 5px solid #dc3545;
+            color: #721c24;
         }
         
         .nav-tabs {
