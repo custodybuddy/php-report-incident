@@ -61,10 +61,31 @@ class Database {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ");
+
+        // Users table for simple authentication
+        $this->db->exec("
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ");
+
+        $this->seedDefaultUser();
     }
-    
+
     public function getConnection() {
         return $this->db;
+    }
+
+    private function seedDefaultUser(): void {
+        $stmt = $this->db->query("SELECT COUNT(*) FROM users");
+        if ((int) $stmt->fetchColumn() === 0) {
+            $passwordHash = password_hash('password', PASSWORD_DEFAULT);
+            $insert = $this->db->prepare("INSERT INTO users (username, password) VALUES (?, ?)");
+            $insert->execute(['admin', $passwordHash]);
+        }
     }
 }
 
@@ -72,6 +93,33 @@ class Database {
 session_start();
 $db = new Database();
 $conn = $db->getConnection();
+
+$view = $_GET['view'] ?? 'dashboard';
+$action = $_POST['action'] ?? null;
+
+function currentUser(PDO $conn): ?array {
+    if (empty($_SESSION['user_id'])) {
+        return null;
+    }
+
+    $stmt = $conn->prepare("SELECT id, username FROM users WHERE id = ?");
+    $stmt->execute([$_SESSION['user_id']]);
+    return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+}
+
+function requireAuth(PDO $conn): void {
+    if (!currentUser($conn)) {
+        header('Location: index.php?view=login');
+        exit;
+    }
+}
+
+$publicViews = ['login'];
+$publicActions = ['login'];
+
+if (!in_array($view, $publicViews, true) && !in_array($action, $publicActions, true)) {
+    requireAuth($conn);
+}
 
 function validateIncident(array $data): array {
     $errors = [];
@@ -128,7 +176,36 @@ function validateUpdate(array $data): array {
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['action'])) {
         switch ($_POST['action']) {
+            case 'login':
+                $username = trim($_POST['username'] ?? '');
+                $password = $_POST['password'] ?? '';
+
+                if ($username === '' || $password === '') {
+                    $_SESSION['message'] = '❌ Username and password are required.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=login');
+                    exit;
+                }
+
+                $stmt = $conn->prepare("SELECT * FROM users WHERE username = ?");
+                $stmt->execute([$username]);
+                $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                if (!$user || !password_verify($password, $user['password'])) {
+                    $_SESSION['message'] = '❌ Invalid credentials. Try admin/password to begin.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=login');
+                    exit;
+                }
+
+                $_SESSION['user_id'] = $user['id'];
+                $_SESSION['message'] = '✅ Welcome back, ' . htmlspecialchars($user['username']) . '!';
+                $_SESSION['message_type'] = 'success';
+                header('Location: index.php');
+                exit;
+
             case 'create_incident':
+                requireAuth($conn);
                 $incidentData = [
                     'incident_date' => $_POST['incident_date'] ?? '',
                     'incident_type' => $_POST['incident_type'] ?? '',
@@ -189,6 +266,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
 
             case 'add_update':
+                requireAuth($conn);
                 $updateData = [
                     'incident_id' => $_POST['incident_id'] ?? '',
                     'update_text' => $_POST['update_text'] ?? '',
@@ -224,8 +302,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $_SESSION['message_type'] = "success";
                 header('Location: index.php?view=detail&id=' . $_POST['incident_id']);
                 exit;
-                
+
             case 'delete_incident':
+                requireAuth($conn);
                 $stmt = $conn->prepare("DELETE FROM incidents WHERE id = ?");
                 $stmt->execute([$_POST['incident_id']]);
                 $_SESSION['message'] = "🗑️ Incident deleted";
@@ -234,6 +313,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
         }
     }
+}
+
+if ($view === 'logout') {
+    session_destroy();
+    session_start();
+    $_SESSION['message'] = '👋 You have been logged out.';
+    $_SESSION['message_type'] = 'info';
+    header('Location: index.php?view=login');
+    exit;
 }
 
 // Export functionality
@@ -365,9 +453,6 @@ $stats = [
     'high_urgency' => $conn->query("SELECT COUNT(*) FROM incidents WHERE urgency_level = 'high'")->fetchColumn(),
     'this_month' => $conn->query("SELECT COUNT(*) FROM incidents WHERE strftime('%Y-%m', incident_date) = strftime('%Y-%m', 'now')")->fetchColumn()
 ];
-
-// Get view mode
-$view = $_GET['view'] ?? 'dashboard';
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -830,7 +915,40 @@ $view = $_GET['view'] ?? 'dashboard';
         .tips-box li {
             margin-bottom: 8px;
         }
-        
+
+        .auth-card {
+            max-width: 420px;
+            margin: 60px auto;
+            padding: 30px;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 15px 40px rgba(0,0,0,0.15);
+        }
+
+        .auth-card h2 {
+            margin-bottom: 10px;
+            color: #1a1a2e;
+        }
+
+        .auth-card p {
+            color: #6c757d;
+            margin-bottom: 20px;
+        }
+
+        .auth-field {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        .auth-field input {
+            padding: 12px;
+            border-radius: 10px;
+            border: 1px solid #dee2e6;
+            font-size: 1em;
+        }
+
         @media (max-width: 768px) {
             .incident-header {
                 flex-direction: column;
@@ -862,7 +980,31 @@ $view = $_GET['view'] ?? 'dashboard';
             </div>
             <?php unset($_SESSION['message'], $_SESSION['message_type']); ?>
         <?php endif; ?>
-        
+
+        <?php if ($view === 'login'): ?>
+            <div class="auth-card">
+                <h2>Sign In</h2>
+                <p>Use the starter account <strong>admin</strong> / <strong>password</strong> to log in.</p>
+                <form method="POST">
+                    <input type="hidden" name="action" value="login">
+                    <div class="auth-field">
+                        <label for="username">Username</label>
+                        <input id="username" type="text" name="username" required>
+                    </div>
+                    <div class="auth-field">
+                        <label for="password">Password</label>
+                        <input id="password" type="password" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="width: 100%;">Login</button>
+                </form>
+            </div>
+        <?php else: ?>
+
+        <div style="padding: 16px 35px 0 35px; display: flex; justify-content: flex-end; gap: 10px; align-items: center;">
+            <div style="color: white; font-weight: 600;">👤 <?php echo htmlspecialchars(currentUser($conn)['username'] ?? ''); ?></div>
+            <a href="?view=logout" class="btn btn-outline">Logout</a>
+        </div>
+
         <?php if ($view === 'dashboard'): ?>
         <div class="nav-tabs">
             <button class="nav-tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1367,8 +1509,9 @@ $view = $_GET['view'] ?? 'dashboard';
             </div>
         </div>
         <?php } endif; ?>
+        <?php endif; ?>
     </div>
-    
+
     <script>
         function showTab(tab) {
             document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
