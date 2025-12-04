@@ -97,9 +97,22 @@ class Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
+                email TEXT,
+                must_reset INTEGER DEFAULT 0,
+                reset_token TEXT,
+                reset_expires DATETIME,
+                failed_attempts INTEGER DEFAULT 0,
+                last_failed_at DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ");
+
+        $this->addColumnIfMissing('users', 'email', 'TEXT');
+        $this->addColumnIfMissing('users', 'must_reset', 'INTEGER DEFAULT 0');
+        $this->addColumnIfMissing('users', 'reset_token', 'TEXT');
+        $this->addColumnIfMissing('users', 'reset_expires', 'DATETIME');
+        $this->addColumnIfMissing('users', 'failed_attempts', 'INTEGER DEFAULT 0');
+        $this->addColumnIfMissing('users', 'last_failed_at', 'DATETIME');
 
         $this->seedDefaultUser();
     }
@@ -112,7 +125,7 @@ class Database {
         $stmt = $this->db->query("SELECT COUNT(*) FROM users");
         if ((int) $stmt->fetchColumn() === 0) {
             $passwordHash = password_hash('password', PASSWORD_DEFAULT);
-            $insert = $this->db->prepare("INSERT INTO users (username, password) VALUES (?, ?)");
+            $insert = $this->db->prepare("INSERT INTO users (username, password, must_reset) VALUES (?, ?, 1)");
             $insert->execute(['admin', $passwordHash]);
         }
     }
@@ -185,8 +198,8 @@ function requireAuth(PDO $conn): void {
     }
 }
 
-$publicViews = ['login'];
-$publicActions = ['login'];
+$publicViews = ['login', 'reset'];
+$publicActions = ['login', 'request_reset', 'complete_reset'];
 $incidentScopeId = isset($_GET['id']) ? (int) $_GET['id'] : (isset($_GET['export']) ? (int) $_GET['export'] : (isset($_GET['download_evidence']) ? (int) $_GET['download_evidence'] : null));
 
 function canUseSharedAccess(?array $shareAccess, string $view, ?int $incidentId = null): bool
@@ -356,17 +369,202 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt->execute([$username]);
                 $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
+                if ($user) {
+                    $cooldownMinutes = 15;
+                    if ((int) $user['failed_attempts'] >= 5 && !empty($user['last_failed_at'])) {
+                        $lastFailure = new DateTime($user['last_failed_at']);
+                        $window = (new DateTime())->modify('-' . $cooldownMinutes . ' minutes');
+                        if ($lastFailure > $window) {
+                            $_SESSION['message'] = '⏳ Too many attempts. Please wait a few minutes before trying again.';
+                            $_SESSION['message_type'] = 'error';
+                            header('Location: index.php?view=login');
+                            exit;
+                        }
+                    }
+                }
+
                 if (!$user || !password_verify($password, $user['password'])) {
+                    if ($user) {
+                        $conn->prepare("UPDATE users SET failed_attempts = failed_attempts + 1, last_failed_at = CURRENT_TIMESTAMP WHERE id = ?")
+                            ->execute([$user['id']]);
+                    }
                     $_SESSION['message'] = '❌ Invalid credentials. Try admin/password to begin.';
                     $_SESSION['message_type'] = 'error';
                     header('Location: index.php?view=login');
                     exit;
                 }
 
+                $conn->prepare("UPDATE users SET failed_attempts = 0, last_failed_at = NULL WHERE id = ?")
+                    ->execute([$user['id']]);
                 $_SESSION['user_id'] = $user['id'];
                 $_SESSION['message'] = '✅ Welcome back, ' . htmlspecialchars($user['username']) . '!';
                 $_SESSION['message_type'] = 'success';
-                header('Location: index.php');
+                if ((int) $user['must_reset'] === 1) {
+                    header('Location: index.php?view=settings');
+                } else {
+                    header('Location: index.php');
+                }
+                exit;
+
+            case 'update_password':
+                requireAuth($conn);
+                $current = $_POST['current_password'] ?? '';
+                $new = $_POST['new_password'] ?? '';
+                $confirm = $_POST['confirm_password'] ?? '';
+
+                $user = currentUser($conn);
+                $stmt = $conn->prepare('SELECT password FROM users WHERE id = ?');
+                $stmt->execute([$user['id']]);
+                $hashed = $stmt->fetchColumn();
+
+                if (!$hashed || !password_verify($current, $hashed)) {
+                    $_SESSION['message'] = '❌ Current password is incorrect.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=settings');
+                    exit;
+                }
+
+                if ($new === '' || $new !== $confirm) {
+                    $_SESSION['message'] = '❌ New password and confirmation must match.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=settings');
+                    exit;
+                }
+
+                $conn->prepare('UPDATE users SET password = ?, must_reset = 0, reset_token = NULL, reset_expires = NULL WHERE id = ?')
+                    ->execute([password_hash($new, PASSWORD_DEFAULT), $user['id']]);
+
+                $_SESSION['message'] = '✅ Password updated successfully.';
+                $_SESSION['message_type'] = 'success';
+                header('Location: index.php?view=settings');
+                exit;
+
+            case 'create_user':
+                requireAuth($conn);
+                $username = trim($_POST['new_username'] ?? '');
+                $email = trim($_POST['new_email'] ?? '');
+                $password = $_POST['new_password'] ?? '';
+                $confirm = $_POST['new_password_confirm'] ?? '';
+
+                if ($username === '' || $password === '') {
+                    $_SESSION['message'] = '❌ Username and password are required for new accounts.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=settings');
+                    exit;
+                }
+
+                if ($password !== $confirm) {
+                    $_SESSION['message'] = '❌ Passwords do not match for new account.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=settings');
+                    exit;
+                }
+
+                try {
+                    $conn->prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)')->execute([
+                        $username,
+                        $email,
+                        password_hash($password, PASSWORD_DEFAULT)
+                    ]);
+                    $_SESSION['message'] = '✅ User created.';
+                    $_SESSION['message_type'] = 'success';
+                } catch (PDOException $e) {
+                    $_SESSION['message'] = '❌ Unable to create user: ' . $e->getMessage();
+                    $_SESSION['message_type'] = 'error';
+                }
+                header('Location: index.php?view=settings');
+                exit;
+
+            case 'request_reset':
+                $username = trim($_POST['username'] ?? '');
+                if ($username === '') {
+                    $_SESSION['message'] = '❌ Username is required to request a reset.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=login');
+                    exit;
+                }
+
+                $stmt = $conn->prepare('SELECT id, email FROM users WHERE username = ?');
+                $stmt->execute([$username]);
+                $user = $stmt->fetch(PDO::FETCH_ASSOC);
+                if ($user) {
+                    $token = bin2hex(random_bytes(16));
+                    $expires = (new DateTime('+30 minutes'))->format('Y-m-d H:i:s');
+                    $conn->prepare('UPDATE users SET reset_token = ?, reset_expires = ?, must_reset = 1 WHERE id = ?')->execute([
+                        $token,
+                        $expires,
+                        $user['id']
+                    ]);
+                    $_SESSION['message'] = '📨 Reset link generated. Use the token: ' . htmlspecialchars($token) . ' within 30 minutes.';
+                    $_SESSION['message_type'] = 'success';
+                } else {
+                    $_SESSION['message'] = '❌ Account not found.';
+                    $_SESSION['message_type'] = 'error';
+                }
+                header('Location: index.php?view=login');
+                exit;
+
+            case 'complete_reset':
+                $token = trim($_POST['token'] ?? '');
+                $new = $_POST['new_password'] ?? '';
+                $confirm = $_POST['confirm_password'] ?? '';
+
+                $stmt = $conn->prepare('SELECT id, reset_expires FROM users WHERE reset_token = ?');
+                $stmt->execute([$token]);
+                $user = $stmt->fetch(PDO::FETCH_ASSOC);
+                if (!$user || empty($token)) {
+                    $_SESSION['message'] = '❌ Invalid reset token.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=login');
+                    exit;
+                }
+
+                if (strtotime($user['reset_expires']) < time()) {
+                    $_SESSION['message'] = '❌ Reset token expired.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=login');
+                    exit;
+                }
+
+                if ($new === '' || $new !== $confirm) {
+                    $_SESSION['message'] = '❌ Passwords must match for reset.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=reset&token=' . urlencode($token));
+                    exit;
+                }
+
+                $conn->prepare('UPDATE users SET password = ?, reset_token = NULL, reset_expires = NULL, must_reset = 0, failed_attempts = 0, last_failed_at = NULL WHERE id = ?')
+                    ->execute([password_hash($new, PASSWORD_DEFAULT), $user['id']]);
+                $_SESSION['message'] = '✅ Password reset. You can log in now.';
+                $_SESSION['message_type'] = 'success';
+                header('Location: index.php?view=login');
+                exit;
+
+            case 'send_reminder_email':
+                requireAuth($conn);
+                $incidentId = (int) ($_POST['incident_id'] ?? 0);
+                $email = trim($_POST['email'] ?? '');
+                if ($incidentId === 0 || $email === '') {
+                    $_SESSION['message'] = '❌ Email address is required.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=dashboard');
+                    exit;
+                }
+                $stmt = $conn->prepare('SELECT incident_type, follow_up_at FROM incidents WHERE id = ?');
+                $stmt->execute([$incidentId]);
+                $incident = $stmt->fetch(PDO::FETCH_ASSOC);
+                if (!$incident) {
+                    $_SESSION['message'] = '❌ Incident not found for reminder.';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=dashboard');
+                    exit;
+                }
+                $subject = 'Incident #' . $incidentId . ' follow-up reminder';
+                $body = 'Reminder: Incident "' . $incident['incident_type'] . '" follow-up due ' . $incident['follow_up_at'];
+                @mail($email, $subject, $body);
+                $_SESSION['message'] = '✅ Reminder email triggered to ' . htmlspecialchars($email);
+                $_SESSION['message_type'] = 'success';
+                header('Location: index.php?view=dashboard');
                 exit;
 
             case 'create_incident':
@@ -874,6 +1072,65 @@ $stats = [
     'resolved' => $conn->query("SELECT COUNT(*) FROM incidents WHERE status = 'resolved'")->fetchColumn(),
     'overdue' => $conn->query("SELECT COUNT(*) FROM incidents WHERE status NOT IN ('resolved','escalated') AND follow_up_at IS NOT NULL AND datetime(follow_up_at) < datetime('now')")->fetchColumn(),
 ];
+
+$filterValues = [
+    'from' => $_GET['from'] ?? '',
+    'to' => $_GET['to'] ?? '',
+    'type' => $_GET['type'] ?? '',
+    'status' => $_GET['status'] ?? '',
+    'urgency' => $_GET['urgency'] ?? '',
+    'keyword' => trim($_GET['keyword'] ?? ''),
+    'sort' => $_GET['sort'] ?? 'incident_date_desc',
+];
+
+$conditions = [];
+$params = [];
+if ($filterValues['from'] !== '') {
+    $conditions[] = 'datetime(incident_date) >= datetime(?)';
+    $params[] = $filterValues['from'];
+}
+if ($filterValues['to'] !== '') {
+    $conditions[] = 'datetime(incident_date) <= datetime(?)';
+    $params[] = $filterValues['to'];
+}
+if ($filterValues['type'] !== '') {
+    $conditions[] = 'incident_type = ?';
+    $params[] = $filterValues['type'];
+}
+if ($filterValues['status'] !== '') {
+    $conditions[] = 'status = ?';
+    $params[] = $filterValues['status'];
+}
+if ($filterValues['urgency'] !== '') {
+    $conditions[] = 'urgency_level = ?';
+    $params[] = $filterValues['urgency'];
+}
+if ($filterValues['keyword'] !== '') {
+    $conditions[] = '(description LIKE ? OR direct_quotes LIKE ?)';
+    $params[] = '%' . $filterValues['keyword'] . '%';
+    $params[] = '%' . $filterValues['keyword'] . '%';
+}
+
+$whereSql = '';
+if (!empty($conditions)) {
+    $whereSql = 'WHERE ' . implode(' AND ', $conditions);
+}
+
+$sortMap = [
+    'incident_date_desc' => 'incident_date DESC',
+    'incident_date_asc' => 'incident_date ASC',
+    'urgency_desc' => 'CASE urgency_level WHEN "high" THEN 3 WHEN "medium" THEN 2 ELSE 1 END DESC, incident_date DESC',
+    'urgency_asc' => 'CASE urgency_level WHEN "high" THEN 3 WHEN "medium" THEN 2 ELSE 1 END ASC, incident_date DESC',
+    'status' => 'status ASC, incident_date DESC',
+];
+$orderSql = $sortMap[$filterValues['sort']] ?? $sortMap['incident_date_desc'];
+
+$incidentStmt = $conn->prepare("SELECT * FROM incidents $whereSql ORDER BY $orderSql");
+$incidentStmt->execute($params);
+$incidents = $incidentStmt->fetchAll(PDO::FETCH_ASSOC);
+
+$incidentTypes = $conn->query("SELECT DISTINCT incident_type FROM incidents ORDER BY incident_type ASC")->fetchAll(PDO::FETCH_COLUMN);
+$dueFollowUps = $conn->query("SELECT * FROM incidents WHERE follow_up_at IS NOT NULL AND status NOT IN ('resolved','escalated') AND datetime(follow_up_at) <= datetime('now', '+3 days') ORDER BY follow_up_at ASC")->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1417,7 +1674,37 @@ $stats = [
                         <input id="password" type="password" name="password" required>
                     </div>
                     <button type="submit" class="btn btn-primary" style="width: 100%;">Login</button>
+                    <a href="?view=reset" style="display:block; text-align:center; margin-top:10px;">Forgot password?</a>
                 </form>
+            </div>
+        <?php elseif ($view === 'reset'): ?>
+            <div class="auth-card">
+                <h2>Password Reset</h2>
+                <form method="POST" style="margin-bottom: 16px;">
+                    <input type="hidden" name="action" value="request_reset">
+                    <div class="auth-field">
+                        <label>Username</label>
+                        <input type="text" name="username" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="width:100%;">Send reset token</button>
+                </form>
+                <form method="POST">
+                    <input type="hidden" name="action" value="complete_reset">
+                    <div class="auth-field">
+                        <label>Reset Token</label>
+                        <input type="text" name="token" required>
+                    </div>
+                    <div class="auth-field">
+                        <label>New Password</label>
+                        <input type="password" name="new_password" required>
+                    </div>
+                    <div class="auth-field">
+                        <label>Confirm Password</label>
+                        <input type="password" name="confirm_password" required>
+                    </div>
+                    <button type="submit" class="btn btn-secondary" style="width:100%;">Update Password</button>
+                </form>
+                <a href="index.php?view=login" style="display:block; text-align:center;">Back to login</a>
             </div>
         <?php else: ?>
 
@@ -1432,6 +1719,8 @@ $stats = [
             <button class="nav-tab" onclick="showTab('list')">📋 All Incidents</button>
             <button class="nav-tab" onclick="showTab('new')">➕ Report Incident</button>
             <button class="nav-tab" onclick="showTab('tips')">💡 Tips & Guide</button>
+            <button class="nav-tab" onclick="showTab('reminders')">⏰ Reminders</button>
+            <button class="nav-tab" onclick="showTab('settings')">⚙️ Settings</button>
         </div>
         
         <div class="content">
@@ -1458,6 +1747,10 @@ $stats = [
                     <div class="stat-card danger">
                         <h3><?php echo $stats['overdue']; ?></h3>
                         <p>Overdue Follow-Ups</p>
+                    </div>
+                    <div class="stat-card" style="border: 1px solid #ffc107; color: #856404;">
+                        <h3><?php echo count($dueFollowUps); ?></h3>
+                        <p>Upcoming Follow-ups (3 days)</p>
                     </div>
                 </div>
                 
@@ -1493,10 +1786,76 @@ $stats = [
             <div id="list-tab" class="tab-content">
                 <h2>All Documented Incidents</h2>
                 <p style="color: #6c757d; margin-bottom: 25px;">Comprehensive record of all co-parenting incidents with timestamps</p>
+
+                <form method="GET" class="incident-filters" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; align-items: end; margin-bottom: 12px;">
+                    <input type="hidden" name="view" value="dashboard">
+                    <div class="form-group">
+                        <label>From</label>
+                        <input type="datetime-local" name="from" value="<?php echo htmlspecialchars($filterValues['from']); ?>">
+                    </div>
+                    <div class="form-group">
+                        <label>To</label>
+                        <input type="datetime-local" name="to" value="<?php echo htmlspecialchars($filterValues['to']); ?>">
+                    </div>
+                    <div class="form-group">
+                        <label>Type</label>
+                        <select name="type">
+                            <option value="">Any</option>
+                            <?php foreach ($incidentTypes as $type): ?>
+                                <option value="<?php echo htmlspecialchars($type); ?>" <?php echo $filterValues['type'] === $type ? 'selected' : ''; ?>><?php echo htmlspecialchars($type); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Status</label>
+                        <select name="status">
+                            <option value="">Any</option>
+                            <?php foreach (['open','in-progress','resolved','escalated'] as $status): ?>
+                                <option value="<?php echo $status; ?>" <?php echo $filterValues['status'] === $status ? 'selected' : ''; ?>><?php echo ucfirst($status); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Urgency</label>
+                        <select name="urgency">
+                            <option value="">Any</option>
+                            <?php foreach (['low','medium','high'] as $urgency): ?>
+                                <option value="<?php echo $urgency; ?>" <?php echo $filterValues['urgency'] === $urgency ? 'selected' : ''; ?>><?php echo ucfirst($urgency); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Keyword</label>
+                        <input type="text" name="keyword" placeholder="Search description or quotes" value="<?php echo htmlspecialchars($filterValues['keyword']); ?>">
+                    </div>
+                    <div class="form-group">
+                        <label>Sort</label>
+                        <select name="sort">
+                            <option value="incident_date_desc" <?php echo $filterValues['sort'] === 'incident_date_desc' ? 'selected' : ''; ?>>Newest first</option>
+                            <option value="incident_date_asc" <?php echo $filterValues['sort'] === 'incident_date_asc' ? 'selected' : ''; ?>>Oldest first</option>
+                            <option value="urgency_desc" <?php echo $filterValues['sort'] === 'urgency_desc' ? 'selected' : ''; ?>>Highest urgency</option>
+                            <option value="urgency_asc" <?php echo $filterValues['sort'] === 'urgency_asc' ? 'selected' : ''; ?>>Lowest urgency</option>
+                            <option value="status" <?php echo $filterValues['sort'] === 'status' ? 'selected' : ''; ?>>Status A-Z</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="display:flex; gap: 8px;">
+                        <button class="btn btn-primary" type="submit">Apply Filters</button>
+                        <a class="btn btn-secondary" href="index.php?view=dashboard">Clear filters</a>
+                    </div>
+                </form>
+
+                <?php if (!empty($conditions)): ?>
+                    <div style="margin-bottom: 15px; display: flex; gap: 8px; flex-wrap: wrap;">
+                        <?php foreach (['from' => 'From', 'to' => 'To', 'type' => 'Type', 'status' => 'Status', 'urgency' => 'Urgency', 'keyword' => 'Keyword'] as $key => $label): ?>
+                            <?php if ($filterValues[$key] !== ''): ?>
+                                <span class="badge" style="background: #e9ecef; color: #495057;"><?php echo $label; ?>: <?php echo htmlspecialchars($filterValues[$key]); ?></span>
+                            <?php endif; ?>
+                        <?php endforeach; ?>
+                        <a href="index.php?view=dashboard" class="btn btn-outline">Clear filters</a>
+                    </div>
+                <?php endif; ?>
                 
-                <?php
-                $incidents = $conn->query("SELECT * FROM incidents ORDER BY incident_date DESC")->fetchAll(PDO::FETCH_ASSOC);
-                if (empty($incidents)): ?>
+                <?php if (empty($incidents)): ?>
                     <div class="empty-state">
                         <h3>📝 No Incidents Documented Yet</h3>
                         <p>Start building your case by documenting the first incident</p>
@@ -1813,8 +2172,75 @@ $stats = [
                     <p style="color: #856404;"><strong>This tool helps you organize documentation. It is not legal advice.</strong> Always consult with a qualified family law attorney about your specific situation. Laws vary by jurisdiction.</p>
                 </div>
             </div>
+
+            <div id="reminders-tab" class="tab-content">
+                <h2>⏰ Reminders & Follow-ups</h2>
+                <p style="color: #6c757d; margin-bottom: 20px;">Due and upcoming follow-ups in the next 72 hours.</p>
+                <?php if (empty($dueFollowUps)): ?>
+                    <div class="empty-state">No follow-ups due.</div>
+                <?php else: ?>
+                    <?php foreach ($dueFollowUps as $due): ?>
+                        <div class="incident-card" style="border-left-color: #ffc107;">
+                            <div class="incident-header">
+                                <div>
+                                    <strong>Incident #<?php echo $due['id']; ?></strong> - <?php echo htmlspecialchars($due['incident_type']); ?>
+                                    <div style="color: #6c757d;">Follow-up by <?php echo date('M j, Y g:i A', strtotime($due['follow_up_at'])); ?></div>
+                                </div>
+                                <span class="badge" style="background: #343a40; color: white;">Status: <?php echo strtoupper($due['status']); ?></span>
+                            </div>
+                            <p><?php echo htmlspecialchars(substr($due['description'], 0, 160)); ?>...</p>
+                            <div class="incident-actions">
+                                <form method="POST" style="display:inline;">
+                                    <input type="hidden" name="action" value="add_update">
+                                    <input type="hidden" name="incident_id" value="<?php echo $due['id']; ?>">
+                                    <input type="hidden" name="update_type" value="follow_up">
+                                    <input type="hidden" name="update_text" value="Follow-up touched from reminders tab">
+                                    <button class="btn btn-secondary" type="submit">Add Update Note</button>
+                                </form>
+                                <form method="POST" style="display:inline;">
+                                    <input type="hidden" name="action" value="update_status">
+                                    <input type="hidden" name="incident_id" value="<?php echo $due['id']; ?>">
+                                    <input type="hidden" name="status" value="resolved">
+                                    <button class="btn btn-success" type="submit">Mark Resolved</button>
+                                </form>
+                                <form method="POST" style="display:inline;">
+                                    <input type="hidden" name="action" value="send_reminder_email">
+                                    <input type="hidden" name="incident_id" value="<?php echo $due['id']; ?>">
+                                    <input type="email" name="email" placeholder="notify@example.com" required style="padding:8px; border-radius:8px; border:1px solid #dee2e6;">
+                                    <button class="btn btn-outline" type="submit">Send Email</button>
+                                </form>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </div>
+
+            <div id="settings-tab" class="tab-content">
+                <h2>⚙️ Account Settings</h2>
+                <div class="detail-section">
+                    <h3>Change Password</h3>
+                    <form method="POST" style="display:grid; gap:12px; max-width:420px;">
+                        <input type="hidden" name="action" value="update_password">
+                        <input type="password" name="current_password" placeholder="Current password" required>
+                        <input type="password" name="new_password" placeholder="New password" required>
+                        <input type="password" name="confirm_password" placeholder="Confirm new password" required>
+                        <button class="btn btn-primary" type="submit">Update Password</button>
+                    </form>
+                </div>
+                <div class="detail-section">
+                    <h3>Invite Additional User</h3>
+                    <form method="POST" style="display:grid; gap:12px; max-width:420px;">
+                        <input type="hidden" name="action" value="create_user">
+                        <input type="text" name="new_username" placeholder="Username" required>
+                        <input type="email" name="new_email" placeholder="Email (optional)">
+                        <input type="password" name="new_password" placeholder="Password" required>
+                        <input type="password" name="new_password_confirm" placeholder="Confirm password" required>
+                        <button class="btn btn-secondary" type="submit">Create User</button>
+                    </form>
+                </div>
+            </div>
         </div>
-        
+
         <?php elseif ($view === 'detail' && isset($_GET['id'])): ?>
         <?php
         $stmt = $conn->prepare("SELECT * FROM incidents WHERE id = ?");
