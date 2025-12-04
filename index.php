@@ -31,9 +31,38 @@ class Database {
                 evidence_list TEXT,
                 legal_violations TEXT,
                 pattern_notes TEXT,
+                status VARCHAR(20) DEFAULT 'open',
+                follow_up_at DATETIME,
                 urgency_level VARCHAR(20) DEFAULT 'medium',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ");
+
+        $this->addColumnIfMissing('incidents', 'status', "VARCHAR(20) DEFAULT 'open'");
+        $this->addColumnIfMissing('incidents', 'follow_up_at', 'DATETIME');
+
+        $this->db->exec("
+            CREATE TABLE IF NOT EXISTS incident_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                incident_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
+            )
+        ");
+
+        $this->db->exec("
+            CREATE TABLE IF NOT EXISTS shared_access (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invite_token TEXT UNIQUE NOT NULL,
+                incident_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                expires_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
             )
         ");
         
@@ -87,15 +116,57 @@ class Database {
             $insert->execute(['admin', $passwordHash]);
         }
     }
+
+    private function addColumnIfMissing(string $table, string $column, string $definition): void
+    {
+        $stmt = $this->db->prepare("PRAGMA table_info($table)");
+        $stmt->execute();
+        $columns = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($columns as $col) {
+            if ($col['name'] === $column) {
+                return;
+            }
+        }
+
+        $this->db->exec("ALTER TABLE $table ADD COLUMN $column $definition");
+    }
 }
 
 // index.php - Main Application
 session_start();
 $db = new Database();
 $conn = $db->getConnection();
+$uploadDir = __DIR__ . '/uploads';
+if (!is_dir($uploadDir)) {
+    mkdir($uploadDir, 0755, true);
+}
 
 $view = $_GET['view'] ?? 'dashboard';
 $action = $_POST['action'] ?? null;
+$shareToken = $_GET['share_token'] ?? ($_POST['share_token'] ?? '');
+$shareAccess = null;
+
+function validateShareAccess(PDO $conn, string $token): ?array {
+    if ($token === '') {
+        return null;
+    }
+
+    $stmt = $conn->prepare("SELECT * FROM shared_access WHERE invite_token = ?");
+    $stmt->execute([$token]);
+    $share = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$share) {
+        return null;
+    }
+
+    if (!empty($share['expires_at']) && strtotime($share['expires_at']) < time()) {
+        return null;
+    }
+
+    return $share;
+}
+
+$shareAccess = validateShareAccess($conn, $shareToken);
 
 function currentUser(PDO $conn): ?array {
     if (empty($_SESSION['user_id'])) {
@@ -116,8 +187,26 @@ function requireAuth(PDO $conn): void {
 
 $publicViews = ['login'];
 $publicActions = ['login'];
+$incidentScopeId = isset($_GET['id']) ? (int) $_GET['id'] : (isset($_GET['export']) ? (int) $_GET['export'] : (isset($_GET['download_evidence']) ? (int) $_GET['download_evidence'] : null));
 
-if (!in_array($view, $publicViews, true) && !in_array($action, $publicActions, true)) {
+function canUseSharedAccess(?array $shareAccess, string $view, ?int $incidentId = null): bool
+{
+    if (!$shareAccess) {
+        return false;
+    }
+
+    $allowedViews = ['detail'];
+    $isDownload = isset($_GET['download_evidence']);
+    $isExport = isset($_GET['export']);
+
+    if ($isDownload || $isExport) {
+        return true;
+    }
+
+    return in_array($view, $allowedViews, true) && ($incidentId === null || $shareAccess['incident_id'] === $incidentId);
+}
+
+if (!in_array($view, $publicViews, true) && !in_array($action, $publicActions, true) && !canUseSharedAccess($shareAccess, $view, $incidentScopeId)) {
     requireAuth($conn);
 }
 
@@ -128,6 +217,7 @@ function validateIncident(array $data): array {
     $incidentType = trim($data['incident_type'] ?? '');
     $description = trim($data['description'] ?? '');
     $urgency = $data['urgency_level'] ?? '';
+    $status = $data['status'] ?? 'open';
 
     if ($incidentDate === '') {
         $errors[] = 'Incident date is required.';
@@ -146,12 +236,87 @@ function validateIncident(array $data): array {
         $errors[] = 'Description is required.';
     }
 
+    $allowedStatus = ['open', 'in-progress', 'resolved', 'escalated'];
+    if (!in_array($status, $allowedStatus, true)) {
+        $errors[] = 'Status is invalid.';
+    }
+
     $allowedUrgency = ['low', 'medium', 'high'];
     if (!in_array($urgency, $allowedUrgency, true)) {
         $errors[] = 'Urgency level is invalid.';
     }
 
     return $errors;
+}
+
+function deriveFollowUpAt(string $urgency): string
+{
+    $intervals = [
+        'low' => '+7 days',
+        'medium' => '+3 days',
+        'high' => '+1 day',
+    ];
+
+    $target = $intervals[$urgency] ?? '+3 days';
+    return (new DateTime($target))->format('Y-m-d\TH:i');
+}
+
+function isAllowedMime(string $mime): bool
+{
+    $allowed = [
+        'image/jpeg', 'image/png', 'image/gif',
+        'application/pdf',
+    ];
+    return in_array($mime, $allowed, true);
+}
+
+function handleEvidenceUploads(PDO $conn, int $incidentId, string $uploadDir): array
+{
+    if (empty($_FILES['evidence_files']) || !is_array($_FILES['evidence_files']['name'])) {
+        return [];
+    }
+
+    $stored = [];
+    $fileCount = count($_FILES['evidence_files']['name']);
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+
+    for ($i = 0; $i < $fileCount; $i++) {
+        $error = $_FILES['evidence_files']['error'][$i];
+        if ($error === UPLOAD_ERR_NO_FILE) {
+            continue;
+        }
+
+        if ($error !== UPLOAD_ERR_OK) {
+            throw new RuntimeException('Upload failed for evidence file.');
+        }
+
+        $tmpName = $_FILES['evidence_files']['tmp_name'][$i];
+        $size = (int) $_FILES['evidence_files']['size'][$i];
+        $originalName = basename($_FILES['evidence_files']['name'][$i]);
+        $mime = $finfo->file($tmpName) ?: '';
+
+        if ($size > 10 * 1024 * 1024) {
+            throw new RuntimeException('Evidence file exceeds 10MB limit.');
+        }
+
+        if (!isAllowedMime($mime)) {
+            throw new RuntimeException('Unsupported evidence type: ' . $mime);
+        }
+
+        $ext = pathinfo($originalName, PATHINFO_EXTENSION);
+        $randomName = bin2hex(random_bytes(16)) . ($ext ? ('.' . $ext) : '');
+        $targetPath = rtrim($uploadDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $randomName;
+
+        if (!move_uploaded_file($tmpName, $targetPath)) {
+            throw new RuntimeException('Failed to store evidence file.');
+        }
+
+        $stmt = $conn->prepare("INSERT INTO incident_evidence (incident_id, file_name, original_name, mime_type) VALUES (?, ?, ?, ?)");
+        $stmt->execute([$incidentId, $randomName, $originalName, $mime]);
+        $stored[] = $randomName;
+    }
+
+    return $stored;
 }
 
 function validateUpdate(array $data): array {
@@ -220,7 +385,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'evidence_list' => $_POST['evidence_list'] ?? '',
                     'legal_violations' => $_POST['legal_violations'] ?? '',
                     'pattern_notes' => $_POST['pattern_notes'] ?? '',
-                    'urgency_level' => $_POST['urgency_level'] ?? ''
+                    'urgency_level' => $_POST['urgency_level'] ?? '',
+                    'status' => $_POST['status'] ?? 'open',
+                    'follow_up_at' => $_POST['follow_up_at'] ?? ''
                 ];
 
                 $incidentData = array_map(function ($value) {
@@ -235,12 +402,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     exit;
                 }
 
+                $followUpAt = $incidentData['follow_up_at'] !== '' ? $incidentData['follow_up_at'] : deriveFollowUpAt($incidentData['urgency_level']);
+
                 $stmt = $conn->prepare("
                     INSERT INTO incidents (incident_date, incident_type, location, communication_method,
                                          witnesses, children_present, description, direct_quotes,
                                          child_impact, your_response, evidence_list, legal_violations,
-                                         pattern_notes, urgency_level)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                         pattern_notes, urgency_level, status, follow_up_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ");
 
                 $stmt->execute([
@@ -257,10 +426,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $incidentData['evidence_list'],
                     $incidentData['legal_violations'],
                     $incidentData['pattern_notes'],
-                    $incidentData['urgency_level']
+                    $incidentData['urgency_level'],
+                    $incidentData['status'],
+                    $followUpAt
                 ]);
 
-                $_SESSION['message'] = "✅ Incident #" . $conn->lastInsertId() . " documented successfully!";
+                $incidentId = (int) $conn->lastInsertId();
+                try {
+                    handleEvidenceUploads($conn, $incidentId, $uploadDir);
+                } catch (Throwable $e) {
+                    $_SESSION['message'] = '⚠️ Incident saved but evidence upload failed: ' . $e->getMessage();
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=detail&id=' . $incidentId);
+                    exit;
+                }
+
+                $_SESSION['message'] = "✅ Incident #" . $incidentId . " documented successfully!";
                 $_SESSION['message_type'] = "success";
                 header('Location: index.php');
                 exit;
@@ -303,6 +484,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 header('Location: index.php?view=detail&id=' . $_POST['incident_id']);
                 exit;
 
+            case 'update_status':
+                requireAuth($conn);
+                $incidentId = (int) ($_POST['incident_id'] ?? 0);
+                $status = $_POST['status'] ?? 'open';
+                $allowedStatus = ['open', 'in-progress', 'resolved', 'escalated'];
+                if (!in_array($status, $allowedStatus, true)) {
+                    $_SESSION['message'] = '❌ Invalid status selection';
+                    $_SESSION['message_type'] = 'error';
+                    header('Location: index.php?view=detail&id=' . $incidentId);
+                    exit;
+                }
+
+                $stmt = $conn->prepare("UPDATE incidents SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+                $stmt->execute([$status, $incidentId]);
+
+                $_SESSION['message'] = '✅ Status updated to ' . strtoupper($status);
+                $_SESSION['message_type'] = 'success';
+                header('Location: index.php?view=detail&id=' . $incidentId);
+                exit;
+
+            case 'create_share':
+                requireAuth($conn);
+                $incidentId = (int) ($_POST['incident_id'] ?? 0);
+                $role = $_POST['role'] ?? 'viewer';
+                $expiresAt = $_POST['expires_at'] ?? '';
+                $token = bin2hex(random_bytes(16));
+
+                $stmt = $conn->prepare("INSERT INTO shared_access (invite_token, incident_id, role, expires_at) VALUES (?, ?, ?, ?)");
+                $stmt->execute([$token, $incidentId, $role, $expiresAt]);
+
+                $_SESSION['message'] = '✅ Share link created';
+                $_SESSION['message_type'] = 'success';
+                header('Location: index.php?view=detail&id=' . $incidentId);
+                exit;
+
+            case 'revoke_share':
+                requireAuth($conn);
+                $incidentId = (int) ($_POST['incident_id'] ?? 0);
+                $shareId = (int) ($_POST['share_id'] ?? 0);
+                $stmt = $conn->prepare("DELETE FROM shared_access WHERE id = ?");
+                $stmt->execute([$shareId]);
+
+                $_SESSION['message'] = '🛡️ Share link revoked';
+                $_SESSION['message_type'] = 'info';
+                header('Location: index.php?view=detail&id=' . $incidentId);
+                exit;
+
             case 'delete_incident':
                 requireAuth($conn);
                 $stmt = $conn->prepare("DELETE FROM incidents WHERE id = ?");
@@ -321,6 +549,37 @@ if ($view === 'logout') {
     $_SESSION['message'] = '👋 You have been logged out.';
     $_SESSION['message_type'] = 'info';
     header('Location: index.php?view=login');
+    exit;
+}
+
+if (isset($_GET['download_evidence'])) {
+    $evidenceId = (int) $_GET['download_evidence'];
+    $stmt = $conn->prepare("SELECT * FROM incident_evidence WHERE id = ?");
+    $stmt->execute([$evidenceId]);
+    $file = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$file) {
+        http_response_code(404);
+        echo 'Evidence not found';
+        exit;
+    }
+
+    if ($shareAccess && (int) $shareAccess['incident_id'] !== (int) $file['incident_id']) {
+        http_response_code(403);
+        echo 'This share link is not authorized for this evidence item.';
+        exit;
+    }
+
+    $filePath = $uploadDir . '/' . $file['file_name'];
+    if (!is_readable($filePath)) {
+        http_response_code(404);
+        echo 'File is missing from storage.';
+        exit;
+    }
+
+    header('Content-Type: ' . $file['mime_type']);
+    header('Content-Disposition: attachment; filename="' . basename($file['original_name']) . '"');
+    readfile($filePath);
     exit;
 }
 
@@ -370,7 +629,7 @@ function generateSimplePdf(array $lines): string {
     return $pdf . $xref . $trailer;
 }
 
-function formatIncidentText(array $incident, array $updates): array {
+function formatIncidentText(array $incident, array $updates, array $evidence): array {
     $lines = [];
     $lines[] = "═══════════════════════════════════════════════════════════════";
     $lines[] = "           CO-PARENTING INCIDENT REPORT - OFFICIAL";
@@ -383,6 +642,8 @@ function formatIncidentText(array $incident, array $updates): array {
     $lines[] = "Report Created:      " . date('F j, Y \a\t g:i A', strtotime($incident['created_at']));
     $lines[] = "Last Updated:        " . date('F j, Y \a\t g:i A', strtotime($incident['updated_at']));
     $lines[] = "Urgency Level:       " . strtoupper($incident['urgency_level']);
+    $lines[] = "Status:              " . strtoupper($incident['status']);
+    $lines[] = "Follow-Up Due:       " . ($incident['follow_up_at'] ? date('F j, Y \a\t g:i A', strtotime($incident['follow_up_at'])) : 'Not set');
     $lines[] = "";
     $lines[] = "INCIDENT DETAILS";
     $lines[] = str_repeat("─", 63);
@@ -419,10 +680,17 @@ function formatIncidentText(array $incident, array $updates): array {
         $lines[] = "";
     }
 
-    if (!empty($incident['evidence_list'])) {
+    if (!empty($incident['evidence_list']) || !empty($evidence)) {
         $lines[] = "SUPPORTING EVIDENCE";
         $lines[] = str_repeat("─", 63);
-        $lines[] = wordwrap($incident['evidence_list'], 63);
+        if (!empty($incident['evidence_list'])) {
+            $lines[] = wordwrap($incident['evidence_list'], 63);
+        }
+        foreach ($evidence as $ev) {
+            $lines[] = "File: " . $ev['original_name'] . " (" . $ev['mime_type'] . ")";
+            $lines[] = "Saved As: " . $ev['file_name'];
+            $lines[] = '';
+        }
         $lines[] = "";
     }
 
@@ -478,7 +746,11 @@ function exportIncident(PDO $conn, int $id, string $format): void {
     $stmt->execute([$id]);
     $updates = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    $lines = formatIncidentText($incident, $updates);
+    $stmt = $conn->prepare("SELECT * FROM incident_evidence WHERE incident_id = ? ORDER BY created_at ASC");
+    $stmt->execute([$id]);
+    $evidence = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $lines = formatIncidentText($incident, $updates, $evidence);
 
     switch ($format) {
         case 'txt':
@@ -496,6 +768,8 @@ function exportIncident(PDO $conn, int $id, string $format): void {
             fputcsv($out, ['Incident', 'Report Created', $incident['created_at']]);
             fputcsv($out, ['Incident', 'Last Updated', $incident['updated_at']]);
             fputcsv($out, ['Incident', 'Urgency Level', strtoupper($incident['urgency_level'])]);
+            fputcsv($out, ['Incident', 'Status', strtoupper($incident['status'])]);
+            fputcsv($out, ['Incident', 'Follow-Up Due', $incident['follow_up_at'] ?: 'Not set']);
             fputcsv($out, ['Details', 'Incident Date/Time', $incident['incident_date']]);
             fputcsv($out, ['Details', 'Incident Type', $incident['incident_type']]);
             fputcsv($out, ['Details', 'Location', $incident['location']]);
@@ -521,6 +795,10 @@ function exportIncident(PDO $conn, int $id, string $format): void {
             if (!empty($incident['pattern_notes'])) {
                 fputcsv($out, ['Analysis', 'Pattern Notes', $incident['pattern_notes']]);
             }
+            foreach ($evidence as $ev) {
+                fputcsv($out, ['Evidence', 'File', $ev['original_name'] . ' (' . $ev['mime_type'] . ')']);
+                fputcsv($out, ['Evidence', 'Stored Name', $ev['file_name']]);
+            }
             foreach ($updates as $i => $update) {
                 fputcsv($out, ['Updates', 'Update #' . ($i + 1), $update['update_type'] . ' - ' . $update['created_at']]);
                 fputcsv($out, ['Updates', 'Details', $update['update_text']]);
@@ -544,6 +822,18 @@ function exportIncident(PDO $conn, int $id, string $format): void {
 if (isset($_GET['export'])) {
     $id = (int) $_GET['export'];
     $format = $_GET['format'] ?? 'txt';
+
+    if ($shareAccess && $shareAccess['incident_id'] !== $id) {
+        http_response_code(403);
+        echo 'This share link is not authorized for this incident.';
+        exit;
+    }
+
+    if ($shareAccess && $shareAccess['role'] !== 'export') {
+        http_response_code(403);
+        echo 'Exports are disabled for this share link.';
+        exit;
+    }
 
     if ($format === 'timeline') {
         // Get all incidents for timeline view
@@ -578,7 +868,11 @@ if (isset($_GET['export'])) {
 $stats = [
     'total' => $conn->query("SELECT COUNT(*) FROM incidents")->fetchColumn(),
     'high_urgency' => $conn->query("SELECT COUNT(*) FROM incidents WHERE urgency_level = 'high'")->fetchColumn(),
-    'this_month' => $conn->query("SELECT COUNT(*) FROM incidents WHERE strftime('%Y-%m', incident_date) = strftime('%Y-%m', 'now')")->fetchColumn()
+    'this_month' => $conn->query("SELECT COUNT(*) FROM incidents WHERE strftime('%Y-%m', incident_date) = strftime('%Y-%m', 'now')")->fetchColumn(),
+    'open' => $conn->query("SELECT COUNT(*) FROM incidents WHERE status = 'open'")->fetchColumn(),
+    'in_progress' => $conn->query("SELECT COUNT(*) FROM incidents WHERE status = 'in-progress'")->fetchColumn(),
+    'resolved' => $conn->query("SELECT COUNT(*) FROM incidents WHERE status = 'resolved'")->fetchColumn(),
+    'overdue' => $conn->query("SELECT COUNT(*) FROM incidents WHERE status NOT IN ('resolved','escalated') AND follow_up_at IS NOT NULL AND datetime(follow_up_at) < datetime('now')")->fetchColumn(),
 ];
 ?>
 <!DOCTYPE html>
@@ -1157,6 +1451,14 @@ $stats = [
                         <h3><?php echo $stats['this_month']; ?></h3>
                         <p>Incidents This Month</p>
                     </div>
+                    <div class="stat-card" style="background: linear-gradient(135deg, #17a2b8 0%, #138496 100%);">
+                        <h3><?php echo $stats['open'] + $stats['in_progress']; ?></h3>
+                        <p>Open / In-Progress</p>
+                    </div>
+                    <div class="stat-card danger">
+                        <h3><?php echo $stats['overdue']; ?></h3>
+                        <p>Overdue Follow-Ups</p>
+                    </div>
                 </div>
                 
                 <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;">
@@ -1209,6 +1511,9 @@ $stats = [
                                 <span class="badge badge-urgency <?php echo $inc['urgency_level']; ?>">
                                     <?php echo strtoupper($inc['urgency_level']); ?> PRIORITY
                                 </span>
+                                <span class="badge" style="background: #343a40; color: white;">
+                                    <?php echo strtoupper($inc['status']); ?>
+                                </span>
                             </div>
                             <div class="incident-date">
                                 📅 <?php echo date('F j, Y • g:i A', strtotime($inc['incident_date'])); ?>
@@ -1244,9 +1549,9 @@ $stats = [
                 <h2>Report New Incident</h2>
                 <p style="color: #6c757d; margin-bottom: 25px;">Document toxic co-parenting behavior with precise detail for court proceedings</p>
                 
-                <form method="POST">
+                <form method="POST" enctype="multipart/form-data">
                     <input type="hidden" name="action" value="create_incident">
-                    
+
                     <div class="form-row">
                         <div class="form-group">
                             <label>
@@ -1265,6 +1570,18 @@ $stats = [
                                 <option value="low">Low - Minor Issue</option>
                                 <option value="medium" selected>Medium - Significant Issue</option>
                                 <option value="high">High - Severe/Dangerous</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                📌 Status
+                                <div class="label-hint">Track progress of this incident</div>
+                            </label>
+                            <select name="status">
+                                <option value="open" selected>Open</option>
+                                <option value="in-progress">In Progress</option>
+                                <option value="resolved">Resolved</option>
+                                <option value="escalated">Escalated</option>
                             </select>
                         </div>
                     </div>
@@ -1375,6 +1692,22 @@ $stats = [
                             <div class="label-hint">What documentation do you have?</div>
                         </label>
                         <textarea name="evidence_list" placeholder="List: Screenshots, text messages, voicemails, photos, videos, police reports, medical records, etc."></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label>
+                            📅 Follow-Up By
+                            <div class="label-hint">Set a reminder for follow-up actions</div>
+                        </label>
+                        <input type="datetime-local" name="follow_up_at" value="<?php echo deriveFollowUpAt('medium'); ?>">
+                    </div>
+
+                    <div class="form-group">
+                        <label>
+                            📎 Upload Evidence Files
+                            <div class="label-hint">Images (JPG/PNG/GIF) and PDFs up to 10MB</div>
+                        </label>
+                        <input type="file" name="evidence_files[]" multiple accept="image/*,application/pdf">
                     </div>
                     
                     <div class="form-group">
@@ -1487,18 +1820,33 @@ $stats = [
         $stmt = $conn->prepare("SELECT * FROM incidents WHERE id = ?");
         $stmt->execute([$_GET['id']]);
         $incident = $stmt->fetch(PDO::FETCH_ASSOC);
-        
+
         if (!$incident) {
             echo '<div class="content"><p>Incident not found.</p><a href="index.php" class="btn btn-primary">Back to Dashboard</a></div>';
         } else {
             $stmt = $conn->prepare("SELECT * FROM incident_updates WHERE incident_id = ? ORDER BY created_at ASC");
             $stmt->execute([$_GET['id']]);
             $updates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $stmt = $conn->prepare("SELECT * FROM incident_evidence WHERE incident_id = ? ORDER BY created_at ASC");
+            $stmt->execute([$_GET['id']]);
+            $evidenceFiles = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $shareLinks = [];
+            if (currentUser($conn)) {
+                $stmt = $conn->prepare("SELECT * FROM shared_access WHERE incident_id = ? ORDER BY created_at DESC");
+                $stmt->execute([$_GET['id']]);
+                $shareLinks = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            }
+
+            if ($shareAccess && (int) $shareAccess['incident_id'] !== (int) $incident['id']) {
+                echo '<div class="content"><p>Share link is not authorized for this incident.</p></div>';
+                exit;
+            }
         ?>
-        
+
         <div class="content">
             <a href="index.php" class="back-link">← Back to Dashboard</a>
-            
+            <?php $shareQuery = $shareToken ? '&share_token=' . urlencode($shareToken) : ''; ?>
+
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; flex-wrap: wrap; gap: 15px;">
                 <div>
                     <h2>Incident #<?php echo str_pad($incident['id'], 4, '0', STR_PAD_LEFT); ?> - Full Report</h2>
@@ -1509,7 +1857,17 @@ $stats = [
                         </span>
                     </div>
                 </div>
-                <a href="?export=<?php echo $incident['id']; ?>&format=txt" class="btn btn-success">📄 Export Full Report</a>
+                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <a href="?export=<?php echo $incident['id']; ?>&format=txt<?php echo $shareQuery; ?>" class="btn btn-success">📄 Export Full Report</a>
+                    <?php if (!$shareAccess): ?>
+                        <form method="POST">
+                            <input type="hidden" name="action" value="update_status">
+                            <input type="hidden" name="incident_id" value="<?php echo $incident['id']; ?>">
+                            <input type="hidden" name="status" value="resolved">
+                            <button type="submit" class="btn btn-primary">✅ Mark Resolved</button>
+                        </form>
+                    <?php endif; ?>
+                </div>
             </div>
             
             <div class="detail-section">
@@ -1539,8 +1897,42 @@ $stats = [
                         <strong>Reported</strong>
                         <?php echo date('F j, Y @ g:i A', strtotime($incident['created_at'])); ?>
                     </div>
+                    <div class="detail-item">
+                        <strong>Status</strong>
+                        <?php echo strtoupper($incident['status']); ?>
+                    </div>
+                    <div class="detail-item">
+                        <strong>Follow-Up Due</strong>
+                        <?php echo $incident['follow_up_at'] ? date('F j, Y @ g:i A', strtotime($incident['follow_up_at'])) : 'Not set'; ?>
+                    </div>
                 </div>
             </div>
+
+            <?php if (!$shareAccess): ?>
+            <div class="detail-section">
+                <h3>⚙️ Status & Follow-Up</h3>
+                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <form method="POST">
+                        <input type="hidden" name="action" value="update_status">
+                        <input type="hidden" name="incident_id" value="<?php echo $incident['id']; ?>">
+                        <input type="hidden" name="status" value="in-progress">
+                        <button class="btn btn-secondary" type="submit">🚧 Mark In-Progress</button>
+                    </form>
+                    <form method="POST">
+                        <input type="hidden" name="action" value="update_status">
+                        <input type="hidden" name="incident_id" value="<?php echo $incident['id']; ?>">
+                        <input type="hidden" name="status" value="escalated">
+                        <button class="btn btn-danger" type="submit">🚨 Escalate</button>
+                    </form>
+                    <form method="POST">
+                        <input type="hidden" name="action" value="update_status">
+                        <input type="hidden" name="incident_id" value="<?php echo $incident['id']; ?>">
+                        <input type="hidden" name="status" value="resolved">
+                        <button class="btn btn-success" type="submit">✅ Resolve</button>
+                    </form>
+                </div>
+            </div>
+            <?php endif; ?>
             
             <div class="detail-section">
                 <h3>📝 Detailed Description</h3>
@@ -1575,6 +1967,89 @@ $stats = [
                 <h3>📎 Evidence</h3>
                 <p style="white-space: pre-wrap; line-height: 1.8;"><?php echo htmlspecialchars($incident['evidence_list']); ?></p>
             </div>
+            <?php endif; ?>
+
+            <?php if (!empty($evidenceFiles)): ?>
+            <div class="detail-section">
+                <h3>🖼️ Evidence Files</h3>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 15px;">
+                    <?php foreach ($evidenceFiles as $file): ?>
+                        <div class="detail-item" style="background: white;">
+                            <strong><?php echo htmlspecialchars($file['original_name']); ?></strong>
+                            <div style="margin: 8px 0; color: #6c757d; font-size: 0.9em;">Type: <?php echo htmlspecialchars($file['mime_type']); ?></div>
+                            <a href="?download_evidence=<?php echo $file['id']; ?><?php echo $shareQuery; ?>" class="btn btn-outline" style="margin-bottom: 10px;">⬇️ Download</a>
+                            <?php if (strpos($file['mime_type'], 'image/') === 0): ?>
+                                <img src="uploads/<?php echo urlencode($file['file_name']); ?>" alt="Evidence image" style="width: 100%; max-height: 200px; object-fit: cover; border-radius: 8px;">
+                            <?php elseif ($file['mime_type'] === 'application/pdf'): ?>
+                                <embed src="uploads/<?php echo urlencode($file['file_name']); ?>" type="application/pdf" style="width: 100%; height: 200px; border: 1px solid #dee2e6; border-radius: 6px;" />
+                            <?php else: ?>
+                                <p style="color: #6c757d;">Preview not available</p>
+                            <?php endif; ?>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <?php endif; ?>
+
+            <?php if (!$shareAccess && currentUser($conn)): ?>
+            <div class="detail-section">
+                <h3>🔗 Shared Access</h3>
+                <form method="POST" style="margin-bottom: 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px;">
+                    <input type="hidden" name="action" value="create_share">
+                    <input type="hidden" name="incident_id" value="<?php echo $incident['id']; ?>">
+                    <div>
+                        <label>Role</label>
+                        <select name="role">
+                            <option value="viewer">Viewer (read-only)</option>
+                            <option value="export">Viewer + Export</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>Expires At</label>
+                        <input type="datetime-local" name="expires_at" value="<?php echo date('Y-m-d\\TH:i', strtotime('+7 days')); ?>">
+                    </div>
+                    <div style="display: flex; align-items: flex-end;">
+                        <button type="submit" class="btn btn-primary">Generate Share Link</button>
+                    </div>
+                </form>
+
+                <?php if (!empty($shareLinks)): ?>
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse;">
+                            <thead>
+                                <tr style="background: #e9ecef;">
+                                    <th style="text-align: left; padding: 8px;">Role</th>
+                                    <th style="text-align: left; padding: 8px;">Expires</th>
+                                    <th style="text-align: left; padding: 8px;">Share Link</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($shareLinks as $link): ?>
+                                <?php $shareUrl = (isset($_SERVER['HTTP_HOST']) ? ((isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http') . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['PHP_SELF']) : 'index.php') . '?view=detail&id=' . $incident['id'] . '&share_token=' . urlencode($link['invite_token']); ?>
+                                <tr>
+                                    <td style="padding: 8px;"><?php echo htmlspecialchars($link['role']); ?></td>
+                                    <td style="padding: 8px;"><?php echo $link['expires_at'] ? htmlspecialchars($link['expires_at']) : 'No expiry'; ?></td>
+                                    <td style="padding: 8px;"><a href="<?php echo htmlspecialchars($shareUrl); ?>" target="_blank">Open Link</a></td>
+                                    <td style="padding: 8px;">
+                                        <form method="POST" onsubmit="return confirm('Revoke this link?');">
+                                            <input type="hidden" name="action" value="revoke_share">
+                                            <input type="hidden" name="incident_id" value="<?php echo $incident['id']; ?>">
+                                            <input type="hidden" name="share_id" value="<?php echo $link['id']; ?>">
+                                            <button type="submit" class="btn btn-danger">Revoke</button>
+                                        </form>
+                                    </td>
+                                </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php else: ?>
+                    <p style="color: #6c757d;">No active shared links.</p>
+                <?php endif; ?>
+            </div>
+            <?php elseif ($shareAccess): ?>
+                <div class="alert info" style="margin-bottom: 20px;">🔒 Read-only shared link access</div>
             <?php endif; ?>
             
             <?php if (!empty($incident['legal_violations'])): ?>
@@ -1612,10 +2087,11 @@ $stats = [
                     <?php endforeach; ?>
                 <?php endif; ?>
                 
+                <?php if (!$shareAccess): ?>
                 <form method="POST" style="margin-top: 25px;">
                     <input type="hidden" name="action" value="add_update">
                     <input type="hidden" name="incident_id" value="<?php echo $incident['id']; ?>">
-                    
+
                     <div class="form-group">
                         <label>Update Type</label>
                         <select name="update_type">
@@ -1626,13 +2102,14 @@ $stats = [
                             <option value="follow_up">Follow-Up Incident</option>
                         </select>
                     </div>
-                    
+
                     <div class="form-group">
                         <label>Add Follow-Up Note</label>
                         <textarea name="update_text" placeholder="Document new developments, follow-up actions, similar incidents, legal steps taken, etc." required></textarea>
                     </div>
                     <button type="submit" class="btn btn-primary">➕ Add Follow-Up</button>
                 </form>
+                <?php endif; ?>
             </div>
         </div>
         <?php } endif; ?>
