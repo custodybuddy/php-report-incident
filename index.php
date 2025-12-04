@@ -325,102 +325,227 @@ if ($view === 'logout') {
 }
 
 // Export functionality
-if (isset($_GET['export'])) {
-    $id = $_GET['export'];
-    $format = $_GET['format'] ?? 'txt';
-    
+function pdfEscape(string $text): string {
+    $escaped = str_replace(['\\', '(', ')'], ['\\\\', '\\(', '\\)'], $text);
+    return preg_replace('/[\r\n]+/', ' ', $escaped);
+}
+
+function generateSimplePdf(array $lines): string {
+    $content = "BT\n/F1 12 Tf\n12 TL\n50 760 Td\n";
+
+    foreach ($lines as $index => $line) {
+        if ($index !== 0) {
+            $content .= "T*\n";
+        }
+        $content .= "(" . pdfEscape($line) . ") Tj\n";
+    }
+
+    $content .= "ET";
+    $length = strlen($content);
+
+    $objects = [];
+    $objects[] = "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n";
+    $objects[] = "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n";
+    $objects[] = "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n";
+    $objects[] = "4 0 obj << /Length $length >> stream\n" . $content . "\nendstream endobj\n";
+    $objects[] = "5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n";
+
+    $pdf = "%PDF-1.4\n";
+    $offsets = [];
+    $running = strlen($pdf);
+    foreach ($objects as $object) {
+        $offsets[] = $running;
+        $pdf .= $object;
+        $running += strlen($object);
+    }
+
+    $xref = "xref\n0 " . (count($offsets) + 1) . "\n0000000000 65535 f \n";
+    foreach ($offsets as $offset) {
+        $xref .= sprintf("%010d 00000 n \n", $offset);
+    }
+
+    $startxref = $running;
+    $trailer = "trailer << /Size " . (count($offsets) + 1) . " /Root 1 0 R >>\nstartxref\n" . $startxref . "\n%%EOF";
+
+    return $pdf . $xref . $trailer;
+}
+
+function formatIncidentText(array $incident, array $updates): array {
+    $lines = [];
+    $lines[] = "═══════════════════════════════════════════════════════════════";
+    $lines[] = "           CO-PARENTING INCIDENT REPORT - OFFICIAL";
+    $lines[] = "═══════════════════════════════════════════════════════════════";
+    $lines[] = "";
+    $lines[] = "REPORT INFORMATION";
+    $lines[] = str_repeat("─", 63);
+    $lines[] = "Report ID:           #" . str_pad($incident['id'], 6, '0', STR_PAD_LEFT);
+    $lines[] = "Generated:           " . date('F j, Y \a\t g:i A T');
+    $lines[] = "Report Created:      " . date('F j, Y \a\t g:i A', strtotime($incident['created_at']));
+    $lines[] = "Last Updated:        " . date('F j, Y \a\t g:i A', strtotime($incident['updated_at']));
+    $lines[] = "Urgency Level:       " . strtoupper($incident['urgency_level']);
+    $lines[] = "";
+    $lines[] = "INCIDENT DETAILS";
+    $lines[] = str_repeat("─", 63);
+    $lines[] = "Date/Time:           " . date('F j, Y \a\t g:i A', strtotime($incident['incident_date']));
+    $lines[] = "Incident Type:       " . $incident['incident_type'];
+    $lines[] = "Location:            " . $incident['location'];
+    $lines[] = "Communication Via:   " . ($incident['communication_method'] ?: 'N/A');
+    $lines[] = "Children Present:    " . ($incident['children_present'] ?: 'N/A');
+    $lines[] = "Witnesses:           " . ($incident['witnesses'] ?: 'None');
+    $lines[] = "";
+    $lines[] = "DETAILED DESCRIPTION";
+    $lines[] = str_repeat("─", 63);
+    $lines[] = wordwrap($incident['description'], 63);
+    $lines[] = "";
+
+    if (!empty($incident['direct_quotes'])) {
+        $lines[] = "DIRECT QUOTES / VERBATIM STATEMENTS";
+        $lines[] = str_repeat("─", 63);
+        $lines[] = wordwrap($incident['direct_quotes'], 63);
+        $lines[] = "";
+    }
+
+    if (!empty($incident['child_impact'])) {
+        $lines[] = "IMPACT ON CHILD(REN)";
+        $lines[] = str_repeat("─", 63);
+        $lines[] = wordwrap($incident['child_impact'], 63);
+        $lines[] = "";
+    }
+
+    if (!empty($incident['your_response'])) {
+        $lines[] = "YOUR RESPONSE";
+        $lines[] = str_repeat("─", 63);
+        $lines[] = wordwrap($incident['your_response'], 63);
+        $lines[] = "";
+    }
+
+    if (!empty($incident['evidence_list'])) {
+        $lines[] = "SUPPORTING EVIDENCE";
+        $lines[] = str_repeat("─", 63);
+        $lines[] = wordwrap($incident['evidence_list'], 63);
+        $lines[] = "";
+    }
+
+    if (!empty($incident['legal_violations'])) {
+        $lines[] = "POTENTIAL LEGAL VIOLATIONS / COURT ORDER BREACHES";
+        $lines[] = str_repeat("─", 63);
+        $lines[] = wordwrap($incident['legal_violations'], 63);
+        $lines[] = "";
+    }
+
+    if (!empty($incident['pattern_notes'])) {
+        $lines[] = "PATTERN ANALYSIS";
+        $lines[] = str_repeat("─", 63);
+        $lines[] = wordwrap($incident['pattern_notes'], 63);
+        $lines[] = "";
+    }
+
+    if (!empty($updates)) {
+        $lines[] = "FOLLOW-UP DOCUMENTATION";
+        $lines[] = str_repeat("─", 63);
+        foreach ($updates as $i => $update) {
+            $lines[] = '';
+            $lines[] = "[Update #" . ($i + 1) . " - " . date('F j, Y \a\t g:i A', strtotime($update['created_at'])) . "]";
+            $lines[] = "Type: " . ucfirst($update['update_type']);
+            $lines[] = wordwrap($update['update_text'], 63);
+        }
+        $lines[] = '';
+    }
+
+    $lines[] = str_repeat("═", 63);
+    $lines[] = "END OF REPORT";
+    $lines[] = "";
+    $lines[] = "This document was generated by CustodyBuddy Incident Reporting System";
+    $lines[] = "Document is timestamped and suitable for legal proceedings.";
+    $lines[] = "Please consult with your attorney regarding use of this documentation.";
+    $lines[] = str_repeat("═", 63);
+
+    return $lines;
+}
+
+function exportIncident(PDO $conn, int $id, string $format): void {
     $stmt = $conn->prepare("SELECT * FROM incidents WHERE id = ?");
     $stmt->execute([$id]);
     $incident = $stmt->fetch(PDO::FETCH_ASSOC);
-    
+
+    if (!$incident) {
+        http_response_code(404);
+        echo "Incident not found.";
+        exit;
+    }
+
     $stmt = $conn->prepare("SELECT * FROM incident_updates WHERE incident_id = ? ORDER BY created_at ASC");
     $stmt->execute([$id]);
     $updates = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    if ($format === 'txt') {
-        header('Content-Type: text/plain; charset=utf-8');
-        header('Content-Disposition: attachment; filename="custody_incident_' . $id . '_' . date('Y-m-d') . '.txt"');
-        
-        echo "═══════════════════════════════════════════════════════════════\n";
-        echo "           CO-PARENTING INCIDENT REPORT - OFFICIAL\n";
-        echo "═══════════════════════════════════════════════════════════════\n\n";
-        
-        echo "REPORT INFORMATION\n";
-        echo str_repeat("─", 63) . "\n";
-        echo "Report ID:           #" . str_pad($incident['id'], 6, '0', STR_PAD_LEFT) . "\n";
-        echo "Generated:           " . date('F j, Y \a\t g:i A T') . "\n";
-        echo "Report Created:      " . date('F j, Y \a\t g:i A', strtotime($incident['created_at'])) . "\n";
-        echo "Last Updated:        " . date('F j, Y \a\t g:i A', strtotime($incident['updated_at'])) . "\n";
-        echo "Urgency Level:       " . strtoupper($incident['urgency_level']) . "\n\n";
-        
-        echo "INCIDENT DETAILS\n";
-        echo str_repeat("─", 63) . "\n";
-        echo "Date/Time:           " . date('F j, Y \a\t g:i A', strtotime($incident['incident_date'])) . "\n";
-        echo "Incident Type:       " . $incident['incident_type'] . "\n";
-        echo "Location:            " . $incident['location'] . "\n";
-        echo "Communication Via:   " . ($incident['communication_method'] ?: 'N/A') . "\n";
-        echo "Children Present:    " . ($incident['children_present'] ?: 'N/A') . "\n";
-        echo "Witnesses:           " . ($incident['witnesses'] ?: 'None') . "\n\n";
-        
-        echo "DETAILED DESCRIPTION\n";
-        echo str_repeat("─", 63) . "\n";
-        echo wordwrap($incident['description'], 63) . "\n\n";
-        
-        if (!empty($incident['direct_quotes'])) {
-            echo "DIRECT QUOTES / VERBATIM STATEMENTS\n";
-            echo str_repeat("─", 63) . "\n";
-            echo wordwrap($incident['direct_quotes'], 63) . "\n\n";
-        }
-        
-        if (!empty($incident['child_impact'])) {
-            echo "IMPACT ON CHILD(REN)\n";
-            echo str_repeat("─", 63) . "\n";
-            echo wordwrap($incident['child_impact'], 63) . "\n\n";
-        }
-        
-        if (!empty($incident['your_response'])) {
-            echo "YOUR RESPONSE\n";
-            echo str_repeat("─", 63) . "\n";
-            echo wordwrap($incident['your_response'], 63) . "\n\n";
-        }
-        
-        if (!empty($incident['evidence_list'])) {
-            echo "SUPPORTING EVIDENCE\n";
-            echo str_repeat("─", 63) . "\n";
-            echo wordwrap($incident['evidence_list'], 63) . "\n\n";
-        }
-        
-        if (!empty($incident['legal_violations'])) {
-            echo "POTENTIAL LEGAL VIOLATIONS / COURT ORDER BREACHES\n";
-            echo str_repeat("─", 63) . "\n";
-            echo wordwrap($incident['legal_violations'], 63) . "\n\n";
-        }
-        
-        if (!empty($incident['pattern_notes'])) {
-            echo "PATTERN ANALYSIS\n";
-            echo str_repeat("─", 63) . "\n";
-            echo wordwrap($incident['pattern_notes'], 63) . "\n\n";
-        }
-        
-        if (!empty($updates)) {
-            echo "FOLLOW-UP DOCUMENTATION\n";
-            echo str_repeat("─", 63) . "\n";
-            foreach ($updates as $i => $update) {
-                echo "\n[Update #" . ($i + 1) . " - " . date('F j, Y \a\t g:i A', strtotime($update['created_at'])) . "]\n";
-                echo "Type: " . ucfirst($update['update_type']) . "\n";
-                echo wordwrap($update['update_text'], 63) . "\n";
+
+    $lines = formatIncidentText($incident, $updates);
+
+    switch ($format) {
+        case 'txt':
+            header('Content-Type: text/plain; charset=utf-8');
+            header('Content-Disposition: attachment; filename="custody_incident_' . $id . '_' . date('Y-m-d') . '.txt"');
+            echo implode("\n", $lines);
+            break;
+        case 'csv':
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename="custody_incident_' . $id . '_' . date('Y-m-d') . '.csv"');
+            $out = fopen('php://output', 'w');
+            fputcsv($out, ['Section', 'Field', 'Value']);
+            fputcsv($out, ['Incident', 'Report ID', '#' . str_pad($incident['id'], 6, '0', STR_PAD_LEFT)]);
+            fputcsv($out, ['Incident', 'Generated', date('c')]);
+            fputcsv($out, ['Incident', 'Report Created', $incident['created_at']]);
+            fputcsv($out, ['Incident', 'Last Updated', $incident['updated_at']]);
+            fputcsv($out, ['Incident', 'Urgency Level', strtoupper($incident['urgency_level'])]);
+            fputcsv($out, ['Details', 'Incident Date/Time', $incident['incident_date']]);
+            fputcsv($out, ['Details', 'Incident Type', $incident['incident_type']]);
+            fputcsv($out, ['Details', 'Location', $incident['location']]);
+            fputcsv($out, ['Details', 'Communication Via', $incident['communication_method'] ?: 'N/A']);
+            fputcsv($out, ['Details', 'Children Present', $incident['children_present'] ?: 'N/A']);
+            fputcsv($out, ['Details', 'Witnesses', $incident['witnesses'] ?: 'None']);
+            fputcsv($out, ['Narrative', 'Description', $incident['description']]);
+            if (!empty($incident['direct_quotes'])) {
+                fputcsv($out, ['Narrative', 'Direct Quotes', $incident['direct_quotes']]);
             }
-            echo "\n";
-        }
-        
-        echo str_repeat("═", 63) . "\n";
-        echo "END OF REPORT\n\n";
-        echo "This document was generated by CustodyBuddy Incident Reporting System\n";
-        echo "Document is timestamped and suitable for legal proceedings.\n";
-        echo "Please consult with your attorney regarding use of this documentation.\n";
-        echo str_repeat("═", 63) . "\n";
-        
-    } elseif ($format === 'timeline') {
+            if (!empty($incident['child_impact'])) {
+                fputcsv($out, ['Narrative', 'Impact on Child(ren)', $incident['child_impact']]);
+            }
+            if (!empty($incident['your_response'])) {
+                fputcsv($out, ['Narrative', 'Your Response', $incident['your_response']]);
+            }
+            if (!empty($incident['evidence_list'])) {
+                fputcsv($out, ['Evidence', 'Supporting Evidence', $incident['evidence_list']]);
+            }
+            if (!empty($incident['legal_violations'])) {
+                fputcsv($out, ['Legal', 'Potential Violations', $incident['legal_violations']]);
+            }
+            if (!empty($incident['pattern_notes'])) {
+                fputcsv($out, ['Analysis', 'Pattern Notes', $incident['pattern_notes']]);
+            }
+            foreach ($updates as $i => $update) {
+                fputcsv($out, ['Updates', 'Update #' . ($i + 1), $update['update_type'] . ' - ' . $update['created_at']]);
+                fputcsv($out, ['Updates', 'Details', $update['update_text']]);
+            }
+            fclose($out);
+            break;
+        case 'pdf':
+            header('Content-Type: application/pdf');
+            header('Content-Disposition: attachment; filename="custody_incident_' . $id . '_' . date('Y-m-d') . '.pdf"');
+            echo generateSimplePdf($lines);
+            break;
+        default:
+            header('Content-Type: text/plain; charset=utf-8');
+            http_response_code(400);
+            echo 'Unsupported format requested.';
+    }
+
+    exit;
+}
+
+if (isset($_GET['export'])) {
+    $id = (int) $_GET['export'];
+    $format = $_GET['format'] ?? 'txt';
+
+    if ($format === 'timeline') {
         // Get all incidents for timeline view
         $stmt = $conn->query("SELECT * FROM incidents ORDER BY incident_date ASC");
         $all_incidents = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -443,8 +568,10 @@ if (isset($_GET['export'])) {
         
         echo str_repeat("═", 63) . "\n";
         echo "End of Timeline\n";
+        exit;
     }
-    exit;
+
+    exportIncident($conn, $id, $format);
 }
 
 // Get statistics
